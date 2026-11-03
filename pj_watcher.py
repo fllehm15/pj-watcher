@@ -274,6 +274,10 @@ def login(page) -> None:
 
     email_field, password_field, visible_inputs = find_login_fields(page)
     log(f"Login page loaded; visible input fields={visible_inputs}.")
+    log(f"DEBUG_URL={page.url}")
+    log(f"DEBUG_TITLE={page.title()}")
+    log(f"DEBUG_INPUT_COUNT={page.locator('input').count()}")
+    log("DEBUG_BODY=" + normalize(page.locator("body").inner_text(timeout=5000))[:1200].replace("\n", " | "))
 
     # A fresh GitHub runner should show a login form. If it does not, fail loudly
     # rather than pretending that an authenticated session exists.
