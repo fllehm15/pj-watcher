@@ -12,6 +12,7 @@ concurrency:
 permissions:
   contents: write
   actions: write
+  issues: write
 
 jobs:
   check:
@@ -25,12 +26,9 @@ jobs:
       TARGET_HOSPITAL_TERMS: ${{ secrets.TARGET_HOSPITAL_TERMS }}
       TARGET_SUBJECT_TERMS: ${{ secrets.TARGET_SUBJECT_TERMS }}
 
-      SMTP_USER: ${{ secrets.SMTP_USER }}
-      SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      GITHUB_TOKEN: ${{ github.token }}
 
       END_AT: "2026-11-24T23:59:00+01:00"
-
       TEST_MODE: ${{ github.event_name == 'workflow_dispatch' }}
 
     steps:
@@ -53,7 +51,7 @@ jobs:
         run: python pj_watcher.py
 
       - name: Status speichern
-        if: ${{ github.event_name == 'schedule' && success() }}
+        if: ${{ always() && github.event_name == 'schedule' }}
         run: |
           if ! git diff --quiet -- state.json; then
             git config user.name "github-actions[bot]"
@@ -72,8 +70,5 @@ jobs:
         run: |
           if [ -f .watcher_expired ]; then
             echo "Enddatum erreicht – Workflow wird deaktiviert."
-            gh api \
-              --method PUT \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/pj-watcher.yml/disable"
+            gh api               --method PUT               -H "Accept: application/vnd.github+json"               "/repos/${GITHUB_REPOSITORY}/actions/workflows/pj-watcher.yml/disable"
           fi
