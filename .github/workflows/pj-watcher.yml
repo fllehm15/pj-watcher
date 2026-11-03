@@ -1,0 +1,79 @@
+name: PJ Portal Watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "2-57/5 * * * *"
+
+concurrency:
+  group: pj-portal-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PJ_PORTAL_URL: https://www2.pj-portal.de/index_lei.php
+      PJ_EMAIL: ${{ secrets.PJ_EMAIL }}
+      PJ_PASSWORD: ${{ secrets.PJ_PASSWORD }}
+      TARGET_HOSPITAL_TERMS: ${{ secrets.TARGET_HOSPITAL_TERMS }}
+      TARGET_SUBJECT_TERMS: ${{ secrets.TARGET_SUBJECT_TERMS }}
+
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+      END_AT: "2026-11-24T23:59:00+01:00"
+
+      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Python-Pakete installieren
+        run: pip install -r requirements.txt
+
+      - name: Chromium für Playwright installieren
+        run: python -m playwright install --with-deps chromium
+
+      - name: PJ-Platz prüfen
+        run: python pj_watcher.py
+
+      - name: Status speichern
+        if: ${{ github.event_name == 'schedule' && success() }}
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update watcher state [skip ci]"
+            git push
+          else
+            echo "Keine Statusänderung zu speichern."
+          fi
+
+      - name: Nach Ablauf automatisch deaktivieren
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f .watcher_expired ]; then
+            echo "Enddatum erreicht – Workflow wird deaktiviert."
+            gh api \
+              --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/pj-watcher.yml/disable"
+          fi
