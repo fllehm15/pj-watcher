@@ -147,8 +147,98 @@ def first_visible(locator):
     return None
 
 
-def has_visible_password(page) -> bool:
-    return first_visible(page.locator('input[type="password"]')) is not None
+def _input_descriptor(page, locator) -> str:
+    """Return non-sensitive metadata around an input for robust field matching."""
+    try:
+        return locator.evaluate(
+            """el => {
+                const bits = [];
+                for (const a of ['type','name','id','placeholder','aria-label','autocomplete']) {
+                    const v = el.getAttribute(a);
+                    if (v) bits.push(v);
+                }
+                const id = el.getAttribute('id');
+                if (id) {
+                    const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                    if (lab) bits.push(lab.innerText || lab.textContent || '');
+                }
+                const parentLabel = el.closest('label');
+                if (parentLabel) bits.push(parentLabel.innerText || parentLabel.textContent || '');
+                const parent = el.parentElement;
+                if (parent) bits.push((parent.innerText || parent.textContent || '').slice(0, 120));
+                return bits.join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+def find_login_fields(page):
+    """Find the login fields without assuming a particular HTML input type."""
+    inputs = page.locator('input')
+    email_best = None
+    password_best = None
+    email_score_best = -1
+    password_score_best = -1
+    visible_count = 0
+
+    try:
+        count = inputs.count()
+    except Exception:
+        count = 0
+
+    for i in range(count):
+        item = inputs.nth(i)
+        try:
+            if not item.is_visible():
+                continue
+        except Exception:
+            continue
+
+        visible_count += 1
+        desc = _input_descriptor(page, item)
+        try:
+            typ = (item.get_attribute('type') or '').lower()
+        except Exception:
+            typ = ''
+
+        email_score = 0
+        if typ == 'email':
+            email_score += 8
+        if any(x in desc for x in ('e-mail', 'email', 'mail')):
+            email_score += 6
+        if any(x in desc for x in ('username', 'benutzer')):
+            email_score += 2
+        if typ in ('text', ''):
+            email_score += 1
+
+        password_score = 0
+        if typ == 'password':
+            password_score += 10
+        if any(x in desc for x in ('passwort', 'password', 'passwd', 'pass')):
+            password_score += 7
+        if 'current-password' in desc:
+            password_score += 5
+
+        if email_score > email_score_best:
+            email_score_best = email_score
+            email_best = item
+        if password_score > password_score_best:
+            password_score_best = password_score
+            password_best = item
+
+    # Require meaningful evidence so we don't fill unrelated inputs.
+    if email_score_best < 5:
+        email_best = None
+    if password_score_best < 5:
+        password_best = None
+
+    return email_best, password_best, visible_count
+
+
+def login_form_present(page) -> bool:
+    email, password, _ = find_login_fields(page)
+    return email is not None and password is not None
 
 
 def login(page) -> None:
@@ -157,31 +247,34 @@ def login(page) -> None:
     if page_has_security_challenge(page):
         raise RuntimeError("Security challenge detected; watcher stopped without bypassing it.")
 
-    if not has_visible_password(page):
-        # Could already be authenticated, but GitHub runs are normally fresh.
-        log("Login form not visible; continuing with current session.")
-        return
+    email_field, password_field, visible_inputs = find_login_fields(page)
+    log(f"Login page loaded; visible input fields={visible_inputs}.")
 
-    password = first_visible(page.locator('input[type="password"]'))
+    # A fresh GitHub runner should show a login form. If it does not, fail loudly
+    # rather than pretending that an authenticated session exists.
+    if email_field is None or password_field is None:
+        body = ""
+        try:
+            body = (page.locator('body').inner_text(timeout=5000) or '').lower()
+        except Exception:
+            pass
+        if 'anmelden' in body or 'passwort' in body or 'e-mail' in body or 'email' in body:
+            raise RuntimeError(
+                "PJ login page is visible, but its login fields could not be identified."
+            )
+        raise RuntimeError(
+            "PJ login form was not found on the configured portal URL."
+        )
 
-    username = first_visible(page.locator('input[type="email"]'))
-    if username is None:
-        username = first_visible(page.locator('input[name*="mail" i]'))
-    if username is None:
-        username = first_visible(page.locator('input[name*="login" i]'))
-    if username is None:
-        # Safe fallback on the login page: first visible text input.
-        username = first_visible(page.locator('input[type="text"]'))
-
-    if username is None or password is None:
-        raise RuntimeError("Login fields could not be located.")
-
-    username.fill(PJ_EMAIL)
-    password.fill(PJ_PASSWORD)
+    email_field.fill(PJ_EMAIL)
+    password_field.fill(PJ_PASSWORD)
 
     submit = first_visible(page.get_by_role("button", name=re.compile(r"anmelden|login", re.I)))
     if submit is None:
         submit = first_visible(page.locator('input[type="submit"]'))
+    if submit is None:
+        # Safe fallback: button/input whose visible value contains "anmelden".
+        submit = first_visible(page.locator('button, input[type="button"]'))
 
     if submit is None:
         raise RuntimeError("Login button could not be located.")
@@ -196,11 +289,11 @@ def login(page) -> None:
     if page_has_security_challenge(page):
         raise RuntimeError("Security challenge appeared after login; no bypass attempted.")
 
-    if has_visible_password(page):
+    # If both fields are still present, the login was probably not accepted.
+    if login_form_present(page):
         raise RuntimeError("Login was not accepted. Check PJ credentials.")
 
     log("PJ portal login successful.")
-
 
 def open_merkliste(page) -> None:
     # Prefer an actual link.
@@ -402,6 +495,22 @@ def main() -> int:
     if is_expired():
         return handle_expiry(state)
 
+    if TEST_MODE:
+        try:
+            send_email(
+                "PJ-Watcher TEST 1/2: E-Mail funktioniert",
+                "Der GitHub-Actions-Test konnte erfolgreich eine E-Mail versenden.\n\n"
+                "Als Nächstes wird der Login ins PJ-Portal und die Merkliste geprüft.\n",
+            )
+            log("MAIL_TEST_OK")
+        except Exception as mail_exc:
+            code = getattr(mail_exc, 'smtp_code', None)
+            log(f"MAIL_TEST_FAILED type={type(mail_exc).__name__} code={code}")
+            raise RuntimeError(
+                "E-Mail test failed. Check SMTP_USER and SMTP_APP_PASSWORD. "
+                f"Error type: {type(mail_exc).__name__}"
+            ) from mail_exc
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -422,7 +531,7 @@ def main() -> int:
 
         if TEST_MODE:
             send_email(
-                "PJ-Watcher TEST: läuft",
+                "PJ-Watcher TEST 2/2: vollständig erfolgreich",
                 "Der manuelle Testlauf war erfolgreich.\n\n"
                 "✓ GitHub Actions läuft.\n"
                 "✓ Login ins PJ-Portal war erfolgreich.\n"
@@ -468,8 +577,9 @@ def main() -> int:
                 "Es wurde nichts gebucht oder verändert. "
                 "Bitte den GitHub-Actions-Lauf kontrollieren.\n",
             )
-        except Exception:
-            log("ERROR_EMAIL_FAILED")
+        except Exception as mail_exc:
+            code = getattr(mail_exc, 'smtp_code', None)
+            log(f"ERROR_EMAIL_FAILED type={type(mail_exc).__name__} code={code}")
 
         return 1
 
