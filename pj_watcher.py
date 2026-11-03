@@ -18,11 +18,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import smtplib
-import ssl
 import sys
+import urllib.request
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,9 +44,9 @@ TARGET_SUBJECT_TERMS = [
     if x.strip()
 ]
 
-SMTP_USER = os.environ.get("SMTP_USER", "").strip()
-SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD", "")
-EMAIL_TO = os.environ.get("EMAIL_TO", "").strip()
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+GITHUB_ACTOR = os.environ.get("GITHUB_ACTOR", "").strip()
 
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() in {"1", "true", "yes"}
 END_AT = os.environ.get("END_AT", "2026-11-24T23:59:00+01:00").strip()
@@ -68,9 +66,9 @@ def require_config() -> None:
         "PJ_PASSWORD": PJ_PASSWORD,
         "TARGET_HOSPITAL_TERMS": "|".join(TARGET_HOSPITAL_TERMS),
         "TARGET_SUBJECT_TERMS": "|".join(TARGET_SUBJECT_TERMS),
-        "SMTP_USER": SMTP_USER,
-        "SMTP_APP_PASSWORD": SMTP_APP_PASSWORD,
-        "EMAIL_TO": EMAIL_TO,
+        "GITHUB_TOKEN": GITHUB_TOKEN,
+        "GITHUB_REPOSITORY": GITHUB_REPOSITORY,
+        "GITHUB_ACTOR": GITHUB_ACTOR,
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
@@ -81,7 +79,7 @@ def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return {"last_status": None, "expired_notified": False}
+        return {"last_status": None, "expired_notified": False, "last_error_key": None}
 
 
 def save_state(state: dict) -> None:
@@ -102,30 +100,46 @@ def is_expired() -> bool:
     return datetime.now(timezone.utc) >= parse_end_at().astimezone(timezone.utc)
 
 
-def send_email(subject: str, body: str) -> None:
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = EMAIL_TO
-    msg.set_content(body)
+def send_notification(subject: str, body: str) -> None:
+    """
+    Create a GitHub issue assigned to / mentioning the repository owner.
+    GitHub can deliver this as an email notification according to the user's
+    notification settings. No external SMTP provider is used.
+    """
+    api_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/issues"
+    safe_body = (
+        f"@{GITHUB_ACTOR}\n\n"
+        + body
+        + "\n\n"
+        + "_Automatisch erstellt vom PJ-Watcher. Keine Buchung wurde vorgenommen._"
+    )
 
-    # Google documents smtp.gmail.com:587 with STARTTLS.
-    # App passwords are often displayed in groups of four; strip whitespace
-    # so either copied form works.
-    app_password = re.sub(r"\s+", "", SMTP_APP_PASSWORD)
-    context = ssl.create_default_context()
+    payload = json.dumps(
+        {
+            "title": subject,
+            "body": safe_body,
+            "assignees": [GITHUB_ACTOR],
+        }
+    ).encode("utf-8")
 
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as smtp:
-        smtp.ehlo()
-        log("SMTP_CONNECT_OK")
-        smtp.starttls(context=context)
-        smtp.ehlo()
-        log("SMTP_STARTTLS_OK")
-        smtp.login(SMTP_USER, app_password)
-        log("SMTP_AUTH_OK")
-        smtp.send_message(msg)
+    req = urllib.request.Request(
+        api_url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "pj-watcher-github-actions",
+        },
+    )
 
-    log("Email sent successfully.")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"GitHub notification failed with HTTP {resp.status}")
+
+    log("GITHUB_NOTIFICATION_OK")
 
 
 def page_has_security_challenge(page) -> bool:
@@ -487,7 +501,7 @@ def handle_expiry(state: dict) -> int:
     log("Configured end time reached. No PJ-Portal request will be made.")
 
     if not state.get("expired_notified"):
-        send_email(
+        send_notification(
             "PJ-Watcher beendet",
             "Der vereinbarte Überwachungszeitraum ist abgelaufen.\n\n"
             "Der Watcher greift ab jetzt nicht mehr auf das PJ-Portal zu und "
@@ -508,19 +522,19 @@ def main() -> int:
 
     if TEST_MODE:
         try:
-            send_email(
-                "PJ-Watcher TEST 1/2: E-Mail funktioniert",
-                "Der GitHub-Actions-Test konnte erfolgreich eine E-Mail versenden.\n\n"
+            send_notification(
+                "PJ-Watcher TEST 1/2: GitHub-Benachrichtigung funktioniert",
+                "Der GitHub-Actions-Test konnte erfolgreich eine GitHub-Benachrichtigung erzeugen.\n\n"
+                "Wenn deine GitHub-Benachrichtigungen per E-Mail aktiviert sind, solltest du dafür auch eine E-Mail erhalten.\n\n"
                 "Als Nächstes wird der Login ins PJ-Portal und die Merkliste geprüft.\n",
             )
-            log("MAIL_TEST_OK")
-        except Exception as mail_exc:
-            code = getattr(mail_exc, 'smtp_code', None)
-            log(f"MAIL_TEST_FAILED type={type(mail_exc).__name__} code={code}")
+            log("NOTIFICATION_TEST_OK")
+        except Exception as notify_exc:
+            log(f"NOTIFICATION_TEST_FAILED type={type(notify_exc).__name__}")
             raise RuntimeError(
-                "E-Mail test failed. Check SMTP_USER and SMTP_APP_PASSWORD. "
-                f"Error type: {type(mail_exc).__name__}"
-            ) from mail_exc
+                "GitHub notification test failed. "
+                f"Error type: {type(notify_exc).__name__}"
+            ) from notify_exc
 
     try:
         with sync_playwright() as p:
@@ -541,7 +555,7 @@ def main() -> int:
         log(f"CHECK_OK status={status}")
 
         if TEST_MODE:
-            send_email(
+            send_notification(
                 "PJ-Watcher TEST 2/2: vollständig erfolgreich",
                 "Der manuelle Testlauf war erfolgreich.\n\n"
                 "✓ GitHub Actions läuft.\n"
@@ -549,16 +563,17 @@ def main() -> int:
                 "✓ Merkliste wurde geöffnet.\n"
                 "✓ Der gewünschte Eintrag wurde gefunden.\n"
                 "✓ Die Verfügbarkeit des 3. Tertials konnte gelesen werden.\n"
-                "✓ Der E-Mail-Versand funktioniert.\n\n"
+                "✓ Die GitHub-Benachrichtigung funktioniert.\n\n"
                 f"Aktueller Status: {human_status(result)}\n\n"
                 "Dies war nur ein Test. Es wurde nichts gebucht oder verändert.\n",
             )
             return 0
 
+        state["last_error_key"] = None
         previous = state.get("last_status")
 
         if status == "available" and previous != "available":
-            send_email(
+            send_notification(
                 "PJ-PLATZ FREI – bitte sofort prüfen",
                 "Der PJ-Watcher hat beim überwachten Platz im 3. Tertial "
                 "mindestens einen freien Platz erkannt.\n\n"
@@ -579,19 +594,24 @@ def main() -> int:
         # Keep public log generic. Full target/page contents are not printed.
         log(f"CHECK_FAILED type={type(exc).__name__}")
 
-        try:
-            send_email(
-                "PJ-Watcher: Prüfung fehlgeschlagen",
-                "Der Watcher konnte den PJ-Platz diesmal nicht zuverlässig prüfen.\n\n"
-                f"Fehlerart: {type(exc).__name__}\n"
-                f"Hinweis: {str(exc)}\n\n"
-                "Es wurde nichts gebucht oder verändert. "
-                "Bitte den GitHub-Actions-Lauf kontrollieren.\n",
-            )
-        except Exception as mail_exc:
-            code = getattr(mail_exc, 'smtp_code', None)
-            log(f"ERROR_EMAIL_FAILED type={type(mail_exc).__name__} code={code}")
+        error_key = f"{type(exc).__name__}:{str(exc)[:180]}"
+        should_notify = TEST_MODE or state.get("last_error_key") != error_key
 
+        if should_notify:
+            try:
+                send_notification(
+                    "PJ-Watcher: Prüfung fehlgeschlagen",
+                    "Der Watcher konnte den PJ-Platz diesmal nicht zuverlässig prüfen.\n\n"
+                    f"Fehlerart: {type(exc).__name__}\n"
+                    f"Hinweis: {str(exc)}\n\n"
+                    "Es wurde nichts gebucht oder verändert. "
+                    "Bitte den GitHub-Actions-Lauf kontrollieren.\n",
+                )
+            except Exception as notify_exc:
+                log(f"ERROR_NOTIFICATION_FAILED type={type(notify_exc).__name__}")
+
+        state["last_error_key"] = error_key
+        save_state(state)
         return 1
 
 
