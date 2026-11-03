@@ -109,9 +109,20 @@ def send_email(subject: str, body: str) -> None:
     msg["To"] = EMAIL_TO
     msg.set_content(body)
 
+    # Google documents smtp.gmail.com:587 with STARTTLS.
+    # App passwords are often displayed in groups of four; strip whitespace
+    # so either copied form works.
+    app_password = re.sub(r"\s+", "", SMTP_APP_PASSWORD)
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as smtp:
-        smtp.login(SMTP_USER, SMTP_APP_PASSWORD)
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as smtp:
+        smtp.ehlo()
+        log("SMTP_CONNECT_OK")
+        smtp.starttls(context=context)
+        smtp.ehlo()
+        log("SMTP_STARTTLS_OK")
+        smtp.login(SMTP_USER, app_password)
+        log("SMTP_AUTH_OK")
         smtp.send_message(msg)
 
     log("Email sent successfully.")
